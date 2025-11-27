@@ -20,7 +20,7 @@ import static org.bytedeco.opencv.global.opencv_imgproc.*;
 
 public class MonitoringTerminal {
     private static final String ROOM_ID = "12101";
-    private static final long EMBEDDING_REFRESH_INTERVAL_MS = 30000; // Refresh embeddings every 5 minutes
+    private static final long EMBEDDING_REFRESH_INTERVAL_MS = 120000; // Refresh embeddings every 5 minutes
     
     private OpenCVFrameGrabber grabber;
     private Net faceNet;
@@ -219,9 +219,54 @@ public class MonitoringTerminal {
     }
 
     private void startBackendUpdateThread() {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                long now = System.currentTimeMillis();
+                Iterator<Map.Entry<String, PresenceInfo>> iterator = activeStudents.entrySet().iterator();
 
+                while (iterator.hasNext()) {
+                    Map.Entry<String, PresenceInfo> entry = iterator.next();
+                    String studentId = entry.getKey();
+                    PresenceInfo info = entry.getValue();
 
-        // todo: add backend calls to store info on presence
+                    if (now - info.getLastSeen() > MAX_GAP_MS) {
+                        // Student left - checkout
+                        if (info.getSessionId() != null) {
+                            try {
+                                APIClient.checkout(info.getSessionId(), now);
+                                System.out.println("✓ Checked out: " + studentId);
+                            } catch (Exception e) {
+                                System.err.println("Failed to checkout " + studentId + ": " + e.getMessage());
+                            }
+                        }
+                        iterator.remove();
+                    } else {
+                        // Student still present
+                        if (info.getSessionId() == null && !info.isSyncedToBackend()) {
+                            // First time seeing this student - checkin
+                            try {
+                                String sessionId = APIClient.checkin(studentId, ROOM_ID, info.getFirstSeen(), info.getLastConfidenceScore());
+                                info.setSessionId(sessionId);
+                                info.setSyncedToBackend(true);
+                                System.out.println("✓ Checked in: " + studentId + " (session: " + sessionId + ")");
+                            } catch (Exception e) {
+                                System.err.println("Failed to checkin " + studentId + ": " + e.getMessage());
+                            }
+                        } else if (info.getSessionId() != null) {
+                            // Update heartbeat
+                            try {
+                                APIClient.heartbeat(info.getSessionId(), now, info.getLastConfidenceScore());
+                            } catch (Exception e) {
+                                System.err.println("Failed to send heartbeat for " + studentId + ": " + e.getMessage());
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, 0, 2, TimeUnit.SECONDS);
     }
 
     private void trackPresence(String id, float confidenceScore) {
@@ -233,8 +278,38 @@ public class MonitoringTerminal {
     }
 
     private void refreshEmbeddings() {
-
-        //todo: add backend call to get students embeddings with current class in this room
+        try {
+            Map<String, Float[]> newEmbeddings = APIClient.getEmbeddings(ROOM_ID);
+            
+            if (newEmbeddings == null) {
+                System.err.println("⚠️  Failed to fetch embeddings from backend (null response)");
+                return;
+            }
+            
+            int oldSize = (knownEmbeddings != null) ? knownEmbeddings.size() : 0;
+            
+            if (newEmbeddings.isEmpty()) {
+                if (oldSize > 0) {
+                    System.out.println("\n⚠️  Class ended or no class scheduled in room " + ROOM_ID + " at this time.");
+                    System.out.println("⚠️  Monitoring will not track any faces until next class.");
+                } else {
+                    System.out.println("⚠️  No class scheduled in room " + ROOM_ID + " at this time.");
+                    System.out.println("⚠️  Monitoring will not track any faces.");
+                }
+            } else {
+                if (oldSize == 0) {
+                    System.out.println("\n✓ Class started! Monitoring room " + ROOM_ID + " with " + newEmbeddings.size() + " registered students.");
+                } else if (newEmbeddings.size() != oldSize) {
+                    System.out.println("\n🔄 Embeddings refreshed: " + newEmbeddings.size() + " students (was " + oldSize + ")");
+                }
+            }
+            
+            knownEmbeddings = new ConcurrentHashMap<>(newEmbeddings);
+            lastEmbeddingRefresh = System.currentTimeMillis();
+        } catch (Exception e) {
+            System.err.println("Failed to refresh embeddings: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
     public static void main(String[] args) {
