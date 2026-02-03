@@ -1,6 +1,7 @@
 package am.mt240.sadoyan.monitoring;
 
 import ai.onnxruntime.*;
+import am.mt240.sadoyan.monitoring.util.FaceAlignment;
 import am.mt240.sadoyan.monitoring.util.MatchResult;
 import am.mt240.sadoyan.monitoring.util.PresenceInfo;
 import org.bytedeco.javacpp.indexer.FloatIndexer;
@@ -159,9 +160,14 @@ public class MonitoringTerminal {
             if (faceMat == null || faceMat.empty())
                 return null;
 
+            Mat alignedFace = FaceAlignment.alignFace(faceMat);
             // --- 3. Resize to 112x112 (ArcFace expected size) ---
             Mat resized = new Mat();
-            resize(faceMat, resized, new Size(112, 112));
+            if (alignedFace.cols() != 112 || alignedFace.rows() != 112) {
+                resize(alignedFace, resized, new Size(112, 112));
+            } else {
+                resized = alignedFace.clone();
+            }
 
             // --- 4. Convert to float32 + normalize ---
             resized.convertTo(resized, CV_32F);
@@ -172,6 +178,10 @@ public class MonitoringTerminal {
             OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(chwData), new long[]{1, 3, 112, 112});
             OrtSession.Result result = session.run(Collections.singletonMap("input.1", inputTensor));
             float[][] output = (float[][]) result.get(0).getValue();
+
+            alignedFace.release();
+            resized.release();
+
             return normalize(output[0]);
         } catch (Exception e) {
             e.printStackTrace();
