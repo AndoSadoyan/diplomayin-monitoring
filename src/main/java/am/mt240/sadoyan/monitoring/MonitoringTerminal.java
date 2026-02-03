@@ -4,11 +4,10 @@ import ai.onnxruntime.*;
 import am.mt240.sadoyan.monitoring.util.FaceAlignment;
 import am.mt240.sadoyan.monitoring.util.MatchResult;
 import am.mt240.sadoyan.monitoring.util.PresenceInfo;
+import am.mt240.sadoyan.monitoring.util.ResourceUtils;
 import org.bytedeco.javacpp.indexer.FloatIndexer;
 import org.bytedeco.javacv.*;
 import org.bytedeco.opencv.opencv_core.*;
-import org.bytedeco.opencv.opencv_dnn.Net;
-import org.bytedeco.opencv.global.opencv_dnn;
 
 import javax.swing.*;
 import java.nio.FloatBuffer;
@@ -22,23 +21,25 @@ import static org.bytedeco.opencv.global.opencv_imgproc.*;
 public class MonitoringTerminal {
     private static final String ROOM_ID = "12101";
     private static final long EMBEDDING_REFRESH_INTERVAL_MS = 120000; // Refresh embeddings every 5 minutes
-    
+
     private OpenCVFrameGrabber grabber;
-    private Net faceNet;
     private OrtEnvironment env;
     private OrtSession session;
+    private OrtSession detSession;
+    private ScrfdDetector scrfd;
     private volatile Map<String, Float[]> knownEmbeddings = new ConcurrentHashMap<>();
     private final Map<String, PresenceInfo> activeStudents = new ConcurrentHashMap<>();
     private volatile long lastEmbeddingRefresh = 0;
 
     public MonitoringTerminal() {
         try {
-            faceNet = opencv_dnn.readNetFromCaffe(
-                    getClass().getClassLoader().getResource("dnn/deploy.prototxt").getPath(),
-                    getClass().getClassLoader().getResource("dnn/res10_300x300_ssd_iter_140000.caffemodel").getPath());
             env = OrtEnvironment.getEnvironment();
-            session = env.createSession(getClass().getClassLoader().getResource(
-                    "models/arcfaceresnet100-insightface.onnx").getPath(), new OrtSession.SessionOptions());
+            String detPath = ResourceUtils.copyResourceToTempFile("models/scrfd_10g_bnkps.onnx", ".onnx");
+            detSession = env.createSession(detPath, new OrtSession.SessionOptions());
+            scrfd = new ScrfdDetector(env, detSession); // defined below
+
+            String recPath = ResourceUtils.copyResourceToTempFile("models/arcfaceresnet100-insightface.onnx", ".onnx");
+            session = env.createSession(recPath, new OrtSession.SessionOptions());
 
             refreshEmbeddings();
 
@@ -62,7 +63,6 @@ public class MonitoringTerminal {
         new Thread(() -> {
             try {
                 while (canvas.isVisible()) {
-                    // Periodically refresh embeddings (e.g., when class changes)
                     long now = System.currentTimeMillis();
                     if (now - lastEmbeddingRefresh > EMBEDDING_REFRESH_INTERVAL_MS) {
                         refreshEmbeddings();
@@ -71,66 +71,61 @@ public class MonitoringTerminal {
                     Frame frameGrab = grabber.grab();
                     if (frameGrab == null) continue;
 
-                    Mat mat = converter.convert(frameGrab);
-                    int w = mat.cols(), h = mat.rows();
+                    Mat frame = converter.convert(frameGrab);
+                    if (frame == null || frame.empty()) continue;
 
-                    Mat blob = opencv_dnn.blobFromImage(mat, 1.0f, new Size(300, 300),
-                            new Scalar(104.0f, 177.0f, 123.0f, 0.0), false, false, CV_32F);
-                    faceNet.setInput(blob);
-                    Mat detections = faceNet.forward();
+                    // 1) Detect faces + 5 landmarks ONCE per frame
+                    List<ScrfdDetector.Detection> dets = scrfd.detect(frame, 0.6f);
 
-                    FloatIndexer indexer = detections.createIndexer();
-                    for (int i = 0; i < detections.size(2); i++) {
-                        float confidence = indexer.get(0, 0, i, 2);
-                        if (confidence > 0.6) {
-                            int x1 = (int) (indexer.get(0, 0, i, 3) * w);
-                            int y1 = (int) (indexer.get(0, 0, i, 4) * h);
-                            int x2 = (int) (indexer.get(0, 0, i, 5) * w);
-                            int y2 = (int) (indexer.get(0, 0, i, 6) * h);
+                    // 2) Process each detected face
+                    for (ScrfdDetector.Detection det : dets) {
+                        if (det == null || det.bbox == null || det.kps5 == null) continue;
 
-                            Rect faceRect = new Rect(x1, y1, x2 - x1, y2 - y1);
-                            if (faceRect.width() < 80 || faceRect.height() < 80) continue;
+                        // Optional minimum size filter
+                        if (det.bbox.width() < 80 || det.bbox.height() < 80) continue;
 
-                            Rect croppedRect = safeRect(faceRect, mat);
-                            rectangle(mat, croppedRect, new Scalar(0, 255, 0, 0), 2, LINE_8, 0);
+                        // Clamp bbox to frame (prevents drawing errors)
+                        Rect bbox = clampRect(det.bbox, frame);
 
-                            Mat face = new Mat(mat, croppedRect).clone();
-                            float[] embedding = computeEmbedding(face);
-                            MatchResult matchResult = matchEmbedding(embedding);
-                            if (matchResult != null && matchResult.getStudentId() != null) {
-                                putText(mat, "Matched: " + matchResult.getStudentId(),
-                                       new Point(croppedRect.x(), croppedRect.y() - 10),
-                                       FONT_HERSHEY_SIMPLEX, 0.7, 
-                                       new Scalar(0, 255, 0, 0), 2, LINE_8, false);
-                                trackPresence(matchResult.getStudentId(), matchResult.getConfidenceScore());
-                            }
+                        // Draw bbox
+                        rectangle(frame, bbox, new Scalar(0, 255, 0, 0), 2, LINE_8, 0);
+
+                        // 3) Compute embedding from aligned face using 5 points
+                        float[] embedding = computeEmbedding(frame, det.kps5);
+                        if (embedding == null) continue;
+
+                        // 4) Match
+                        MatchResult match = matchEmbedding(embedding);
+                        if (match != null && match.getStudentId() != null) {
+                            putText(frame, "Matched: " + match.getStudentId(),
+                                    new Point(bbox.x(), Math.max(0, bbox.y() - 10)),
+                                    FONT_HERSHEY_SIMPLEX, 0.7,
+                                    new Scalar(0, 255, 0, 0), 2, LINE_8, false);
+
+                            trackPresence(match.getStudentId(), match.getConfidenceScore());
                         }
                     }
-                    canvas.showImage(converter.convert(mat));
+
+                    canvas.showImage(converter.convert(frame));
                     Thread.sleep(33);
                 }
             } catch (Exception e) {
                 e.printStackTrace();
             } finally {
-                try {
-                    grabber.stop();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+                try { grabber.stop(); } catch (Exception ignored) {}
                 canvas.dispose();
             }
         }).start();
     }
 
-    private Rect safeRect(Rect rect, Mat mat) {
-        int x1 = Math.max(rect.x() - 10, 0);
-        int y1 = Math.max(rect.y() - 10, 0);
-        int x2 = Math.min(rect.x() + rect.width() + 10, mat.cols());
-        int y2 = Math.min(rect.y() + rect.height() + 10, mat.rows());
-
-        int w = Math.max(x2 - x1, 1);
-        int h = Math.max(y2 - y1, 1);
-
+    // Keeps a rectangle inside the image boundaries (no expansion)
+    private Rect clampRect(Rect r, Mat img) {
+        int x1 = Math.max(r.x(), 0);
+        int y1 = Math.max(r.y(), 0);
+        int x2 = Math.min(r.x() + r.width(), img.cols());
+        int y2 = Math.min(r.y() + r.height(), img.rows());
+        int w = Math.max(1, x2 - x1);
+        int h = Math.max(1, y2 - y1);
         return new Rect(x1, y1, w, h);
     }
 
@@ -155,32 +150,32 @@ public class MonitoringTerminal {
         return chw;
     }
 
-    public float[] computeEmbedding(Mat faceMat) {
+    public float[] computeEmbedding(Mat frameBgr, Point2f[] kps5) {
         try {
-            if (faceMat == null || faceMat.empty())
+            if (frameBgr == null || frameBgr.empty() || kps5 == null || kps5.length != 5)
                 return null;
 
-            Mat alignedFace = FaceAlignment.alignFace(faceMat);
-            // --- 3. Resize to 112x112 (ArcFace expected size) ---
-            Mat resized = new Mat();
-            if (alignedFace.cols() != 112 || alignedFace.rows() != 112) {
-                resize(alignedFace, resized, new Size(112, 112));
-            } else {
-                resized = alignedFace.clone();
-            }
+            // 1) Align using 5 landmarks -> returns 112x112 already
+            Mat aligned112 = FaceAlignment.alignFace(frameBgr, kps5);
+            if (aligned112 == null || aligned112.empty()) return null;
 
-            // --- 4. Convert to float32 + normalize ---
-            resized.convertTo(resized, CV_32F);
-            resized = subtract(resized, new Scalar(127.5,127.5,127.5,0)).asMat();
-            resized = multiply(resized, 1.0/127.5).asMat();
+            // 2) float32 + normalize exactly like your registration pipeline
+            aligned112.convertTo(aligned112, CV_32F);
+            aligned112 = subtract(aligned112, new Scalar(127.5, 127.5, 127.5, 0)).asMat();
+            aligned112 = multiply(aligned112, 1.0 / 127.5).asMat();
 
-            float[] chwData = matToCHWFloatArray(resized);
-            OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(chwData), new long[]{1, 3, 112, 112});
+            float[] chwData = matToCHWFloatArray(aligned112);
+
+            OnnxTensor inputTensor = OnnxTensor.createTensor(
+                    env, FloatBuffer.wrap(chwData), new long[]{1, 3, 112, 112}
+            );
+
             OrtSession.Result result = session.run(Collections.singletonMap("input.1", inputTensor));
             float[][] output = (float[][]) result.get(0).getValue();
 
-            alignedFace.release();
-            resized.release();
+            aligned112.release();
+            inputTensor.close();
+            result.close();
 
             return normalize(output[0]);
         } catch (Exception e) {
@@ -188,6 +183,7 @@ public class MonitoringTerminal {
             return null;
         }
     }
+
 
     private float[] normalize(float[] embedding) {
         float norm = 0f;
@@ -201,7 +197,7 @@ public class MonitoringTerminal {
         if (embedding == null || knownEmbeddings == null || knownEmbeddings.isEmpty()) {
             return null;
         }
-        
+
         String bestMatch = null;
         float bestScore = -1f;
         for (Map.Entry<String, Float[]> entry : knownEmbeddings.entrySet()) {
@@ -290,14 +286,14 @@ public class MonitoringTerminal {
     private void refreshEmbeddings() {
         try {
             Map<String, Float[]> newEmbeddings = APIClient.getEmbeddings(ROOM_ID);
-            
+
             if (newEmbeddings == null) {
                 System.err.println("⚠️  Failed to fetch embeddings from backend (null response)");
                 return;
             }
-            
+
             int oldSize = (knownEmbeddings != null) ? knownEmbeddings.size() : 0;
-            
+
             if (newEmbeddings.isEmpty()) {
                 if (oldSize > 0) {
                     System.out.println("\n⚠️  Class ended or no class scheduled in room " + ROOM_ID + " at this time.");
@@ -313,7 +309,7 @@ public class MonitoringTerminal {
                     System.out.println("\n🔄 Embeddings refreshed: " + newEmbeddings.size() + " students (was " + oldSize + ")");
                 }
             }
-            
+
             knownEmbeddings = new ConcurrentHashMap<>(newEmbeddings);
             lastEmbeddingRefresh = System.currentTimeMillis();
         } catch (Exception e) {
