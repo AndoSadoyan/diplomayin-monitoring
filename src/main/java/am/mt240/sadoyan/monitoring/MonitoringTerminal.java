@@ -10,6 +10,8 @@ import org.bytedeco.javacv.*;
 import org.bytedeco.opencv.opencv_core.*;
 
 import javax.swing.*;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.FloatBuffer;
 import java.util.*;
 import java.util.concurrent.*;
@@ -19,8 +21,8 @@ import static org.bytedeco.opencv.global.opencv_core.*;
 import static org.bytedeco.opencv.global.opencv_imgproc.*;
 
 public class MonitoringTerminal {
-    private static final String ROOM_ID = "12101";
-    private static final long EMBEDDING_REFRESH_INTERVAL_MS = 120000; // Refresh embeddings every 5 minutes
+    private static final String ROOM_ID = loadRoomId();
+    private static final long EMBEDDING_REFRESH_INTERVAL_MS = 300000; // Refresh embeddings every 5 minutes
 
     private OpenCVFrameGrabber grabber;
     private OrtEnvironment env;
@@ -151,36 +153,37 @@ public class MonitoringTerminal {
     }
 
     public float[] computeEmbedding(Mat frameBgr, Point2f[] kps5) {
+        if (frameBgr == null || frameBgr.empty() || kps5 == null || kps5.length != 5)
+            return null;
+
+        Mat current = FaceAlignment.alignFace(frameBgr, kps5);
+        if (current == null || current.empty()) return null;
+
         try {
-            if (frameBgr == null || frameBgr.empty() || kps5 == null || kps5.length != 5)
-                return null;
+            current.convertTo(current, CV_32F);
 
-            // 1) Align using 5 landmarks -> returns 112x112 already
-            Mat aligned112 = FaceAlignment.alignFace(frameBgr, kps5);
-            if (aligned112 == null || aligned112.empty()) return null;
+            Mat sub = subtract(current, new Scalar(127.5, 127.5, 127.5, 0)).asMat();
+            current.release();
+            current = sub;
 
-            // 2) float32 + normalize exactly like your registration pipeline
-            aligned112.convertTo(aligned112, CV_32F);
-            aligned112 = subtract(aligned112, new Scalar(127.5, 127.5, 127.5, 0)).asMat();
-            aligned112 = multiply(aligned112, 1.0 / 127.5).asMat();
+            Mat mul = multiply(current, 1.0 / 127.5).asMat();
+            current.release();
+            current = mul;
 
-            float[] chwData = matToCHWFloatArray(aligned112);
+            float[] chwData = matToCHWFloatArray(current);
+            current.release();
+            current = null;
 
-            OnnxTensor inputTensor = OnnxTensor.createTensor(
-                    env, FloatBuffer.wrap(chwData), new long[]{1, 3, 112, 112}
-            );
-
-            OrtSession.Result result = session.run(Collections.singletonMap("input.1", inputTensor));
-            float[][] output = (float[][]) result.get(0).getValue();
-
-            aligned112.release();
-            inputTensor.close();
-            result.close();
-
-            return normalize(output[0]);
+            try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(chwData), new long[]{1, 3, 112, 112});
+                 OrtSession.Result result = session.run(Collections.singletonMap("input.1", inputTensor))) {
+                float[][] output = (float[][]) result.get(0).getValue();
+                return normalize(output[0]);
+            }
         } catch (Exception e) {
             e.printStackTrace();
             return null;
+        } finally {
+            if (current != null) current.release();
         }
     }
 
@@ -202,7 +205,7 @@ public class MonitoringTerminal {
         float bestScore = -1f;
         for (Map.Entry<String, Float[]> entry : knownEmbeddings.entrySet()) {
             float score = cosineSimilarity(embedding, entry.getValue());
-            if (score > bestScore && score >= 0.5f) {
+            if (score > bestScore && score >= 0.7f) {
                 bestScore = score;
                 bestMatch = entry.getKey();
             }
@@ -316,6 +319,17 @@ public class MonitoringTerminal {
             System.err.println("Failed to refresh embeddings: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private static String loadRoomId() {
+        Properties props = new Properties();
+        try (FileInputStream fis = new FileInputStream("config.properties")) {
+            props.load(fis);
+            String roomId = props.getProperty("room.id");
+            if (roomId != null && !roomId.isBlank()) return roomId.trim();
+        } catch (IOException ignored) {}
+        System.err.println("config.properties not found or missing room.id — using default 12101");
+        return "12101";
     }
 
     public static void main(String[] args) {

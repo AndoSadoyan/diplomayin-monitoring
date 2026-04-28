@@ -1,7 +1,7 @@
 package am.mt240.sadoyan.monitoring.util;
 
 public class PresenceInfo {
-    public static final long MAX_GAP_MS = 10000; // 10 seconds without detection = exit
+    public static final long MAX_GAP_MS = 45000; // 45 seconds without detection = exit
 
     private String sessionId;
     private long firstSeen;
@@ -18,10 +18,6 @@ public class PresenceInfo {
     public void updateLastSeen(float confidenceScore) {
         this.lastSeen = System.currentTimeMillis();
         this.lastConfidenceScore = confidenceScore;
-    }
-
-    public boolean isStillPresent(long currentTime) {
-        return (currentTime - lastSeen) < MAX_GAP_MS;
     }
 
     public String getSessionId() {
